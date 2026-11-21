@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Touch Some Grass</title>
+<style>
+:root{--ctl:var(--fg);--bg:#ecebe6;--fg:#22231f;--mut:#6d6e66;--line:#cfcdc4;--acc:#4f6247;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#151613;--fg:#eceae3;--mut:#99998f;--line:#383a33;--acc:#a9be9c;color-scheme:dark}}
+:root[data-theme="dark"]{--bg:#151613;--fg:#eceae3;--mut:#99998f;--line:#383a33;--acc:#a9be9c;color-scheme:dark}
+html{scroll-padding-top:env(safe-area-inset-top,0px)}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.5 "Pretendard","Apple SD Gothic Neo","Noto Sans KR",system-ui,sans-serif}
+main{max-width:980px;margin:0 auto;padding:20px 16px 32px}
+h1{font-size:1.35rem;margin:0 0 14px}
+.ctl{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:14px 22px;align-items:end;margin-bottom:16px}
+.ctl label{display:block;font-size:.85rem;color:var(--mut)}
+.ctl output{color:var(--fg)}
+input[type=range]{width:100%;accent-color:var(--ctl);margin:6px 0 0}
+.btn{display:inline-block;text-align:center;padding:10px 14px;border:1px solid var(--ctl);border-radius:8px;cursor:pointer;font-size:.92rem}
+.btn input{position:absolute;opacity:0;width:1px;height:1px}
+#wrap{position:relative;border-radius:10px;overflow:hidden;box-shadow:0 0 0 1px var(--line);line-height:0}
+#wrap.drag{outline:2px dashed var(--acc);outline-offset:-6px}
+canvas{display:block;touch-action:none;cursor:none}
+#ring{position:absolute;left:0;top:0;border:1.5px solid rgba(255,255,255,.6);border-radius:50%;pointer-events:none;opacity:0;transition:opacity .15s}
+.hint{margin-top:10px;font-size:.82rem;color:var(--mut)}
+</style>
+</head>
+<body>
+<main>
+<h1>Touch Some Grass</h1>
+<div class="ctl">
+  <label class="btn"><input type="file" id="file" accept="image/*">사진 올리기</label>
+  <div><label for="cnt">털 개수 <output id="cntV"></output></label><input type="range" id="cnt" min="1500" step="500" value="6000"></div>
+  <div><label for="rad">만지는 범위 <output id="radV"></output></label><input type="range" id="rad" min="30" max="220" step="2" value="90"></div>
+  <div><label for="len">털 길이 <output id="lenV"></output></label><input type="range" id="len" min="0" max="2" step="1" value="0"></div>
+</div>
+<div id="wrap"><canvas id="cv"></canvas><div id="ring"></div></div>
+<p class="hint">사진은 서버로 전송되지 않고 브라우저에서만 처리됩니다.</p>
+</main>
+<script>
+const $=id=>document.getElementById(id),cv=$('cv'),wrap=$('wrap'),ring=$('ring');
+const gl=cv.getContext('webgl2',{antialias:false,premultipliedAlpha:true});
+if(!gl){wrap.outerHTML='<p>이 브라우저는 WebGL2를 지원하지 않습니다.</p>';throw 0;}
+const coarse=matchMedia('(pointer:coarse)').matches, CAP=coarse?10000:20000, DPRMAX=coarse?1.5:2;
+$('cnt').max=CAP; $('cnt').value=coarse?5000:6000;
+
+const VS=`#version 300 es
+precision highp float;
+in vec2 a_c; in vec4 a_i; in vec3 a_col; in vec2 a_off;
+uniform vec2 u_res; uniform float u_time,u_w,u_ls;
+out vec2 v_p; out float v_len,v_hw,v_k; out vec3 v_col;
+void main(){
+  float len=a_i.z*u_ls, hw=u_w*.5; vec2 c=a_i.xy;
+  vec2 o=a_off+vec2(sin(u_time*2.+a_i.w)*len*.12,0.);   // CPU 스프링 오프셋 + 배경 파동(sin 1회)
+  float m=length(vec2(o.x/1.5,o.y)); o*=min(1.,len*1.5/max(m,.001));
+  vec2 dir=normalize(vec2(o.x,-len+o.y)+vec2(0.,-.001));
+  vec2 b=vec2(c.x,c.y+len*.5);                              // 아래 끝점(고정)
+  float S=a_c.y<0.?-hw:len+hw, U=a_c.x*hw;
+  vec2 p=b+dir*S+vec2(-dir.y,dir.x)*U, z=p/u_res*2.-1.;
+  gl_Position=vec4(z.x,-z.y,0.,1.);
+  v_p=vec2(U,S); v_len=len; v_hw=hw; v_col=a_col;
+  float v=max(a_col.r,max(a_col.g,a_col.b)); v_k=v>0.?max(0.,(v-.05)/v):0.; // 밝기(V) -5
+}`;
+const FS=`#version 300 es
+precision highp float;
+in vec2 v_p; in float v_len,v_hw,v_k; in vec3 v_col; uniform float u_dpr; out vec4 o;
+void main(){
+  float sc=clamp(v_p.y,0.,v_len), d=length(vec2(v_p.x,v_p.y-sc));
+  float a=clamp((v_hw-d)*u_dpr+.5,0.,1.); if(a<=0.) discard;
+  vec3 col=v_col*mix(v_k,1.,sc/v_len);                       // 아래 -5 → 위 원본색
+  o=vec4(col*a,a);
+}`;
+function sh(t,s){const x=gl.createShader(t);gl.shaderSource(x,s);gl.compileShader(x);if(!gl.getShaderParameter(x,gl.COMPILE_STATUS))console.error(gl.getShaderInfoLog(x));return x;}
+const prog=gl.createProgram();gl.attachShader(prog,sh(gl.VERTEX_SHADER,VS));gl.attachShader(prog,sh(gl.FRAGMENT_SHADER,FS));gl.linkProgram(prog);gl.useProgram(prog);
+const U={};['u_res','u_time','u_w','u_dpr','u_ls'].forEach(n=>U[n]=gl.getUniformLocation(prog,n));
+const vao=gl.createVertexArray();gl.bindVertexArray(vao);
+const qb=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,qb);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,1,-1,-1,1,1,1]),gl.STATIC_DRAW);
+const ac=gl.getAttribLocation(prog,'a_c');gl.enableVertexAttribArray(ac);gl.vertexAttribPointer(ac,2,gl.FLOAT,false,0,0);
+const ib=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,ib);
+[['a_i',4,0],['a_col',3,16]].forEach(([n,sz,off])=>{const l=gl.getAttribLocation(prog,n);gl.enableVertexAttribArray(l);gl.vertexAttribPointer(l,sz,gl.FLOAT,false,28,off);gl.vertexAttribDivisor(l,1);});
+const ob=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,ob);
+{const l=gl.getAttribLocation(prog,'a_off');gl.enableVertexAttribArray(l);gl.vertexAttribPointer(l,2,gl.FLOAT,false,0,0);gl.vertexAttribDivisor(l,1);}
+gl.enable(gl.BLEND);gl.blendFunc(gl.ONE,gl.ONE_MINUS_SRC_ALPHA);
+
+let src,W,H,dpr,pix,step,N=0,R=90,lenMul=1;
+let X,Y,OX,OY,VX,VY,OFF; // 털별 스프링 상태 (TypedArray)
+let tx=-1e4,ty=-1e4,hx=-1e4,hy=-1e4,px_=-1e4,py_=-1e4,Dx=0,Dy=0,inside=false; // 포인터 목표/부드러운 위치/이전 위치/끌림 방향
+
+// 어두운 색 판별: 참고 코드(jizard.tistory.com/420)의 HSP 방식, 127.5 이하면 어두운 색
+function isDark(r,g,b){return Math.sqrt(.299*r*r+.587*g*g+.114*b*b)<=127.5;}
+let themed=false; // 이미지가 바뀔 때만 평균색을 계산(리사이즈·슬라이더로는 재계산 안 함)
+function applyTheme(){
+  let r=0,g=0,b=0;for(let i=0,n=pix.length;i<n;i+=4){r+=pix[i];g+=pix[i+1];b+=pix[i+2];}
+  const c=pix.length/4;r=Math.round(r/c);g=Math.round(g/c);b=Math.round(b/c);
+  const d=isDark(r,g,b),s=document.documentElement.style;
+  s.setProperty('--bg',`rgb(${r},${g},${b})`);
+  s.setProperty('--fg',d?'#fff':'#000');
+  s.setProperty('--mut',d?'rgba(255,255,255,.7)':'rgba(0,0,0,.7)');
+  s.colorScheme=d?'dark':'light';
+}
+function demo(){
+  const c=document.createElement('canvas');c.width=900;c.height=640;const g=c.getContext('2d'),gr=g.createLinearGradient(0,0,900,640);
+  gr.addColorStop(0,'#f3c98b');gr.addColorStop(.5,'#d9805f');gr.addColorStop(1,'#3d4f6b');g.fillStyle=gr;g.fillRect(0,0,900,640);
+  [[250,260,170,'#fff4d6'],[640,200,120,'#1f2a3d'],[560,460,150,'#9fd0c0'],[150,500,90,'#5b2a3a']].forEach(([x,y,r,col])=>{
+    const rg=g.createRadialGradient(x,y,0,x,y,r);rg.addColorStop(0,col);rg.addColorStop(1,'transparent');g.fillStyle=rg;g.fillRect(0,0,900,640);});
+  src=c;
+}
+function build(){ // 이미지가 바뀌거나 크기가 변할 때만 getImageData 1회
+  const sw=src.naturalWidth||src.width,sh=src.naturalHeight||src.height;
+  W=Math.min(wrap.clientWidth,980);H=Math.round(W*sh/sw);dpr=Math.min(devicePixelRatio||1,DPRMAX);
+  cv.width=Math.round(W*dpr);cv.height=Math.round(H*dpr);cv.style.width=W+'px';cv.style.height=H+'px';
+  const o=document.createElement('canvas');o.width=W;o.height=H;const oc=o.getContext('2d',{willReadFrequently:true});
+  oc.drawImage(src,0,0,W,H);pix=oc.getImageData(0,0,W,H).data;if(!themed){applyTheme();themed=true;}rebuild();
+}
+function rebuild(){ // 슬라이더 변경 시: 저장된 픽셀로 털 데이터만 다시 만들어 GPU에 1회 업로드
+  step=Math.sqrt(W*H/+$('cnt').value);const cols=Math.ceil(W/step),rows=Math.ceil(H/step);N=cols*rows;
+  const d=new Float32Array(N*7);let n=0,ar=0,ag=0,ab=0;
+  for(let j=0;j<rows;j++)for(let i=0;i<cols;i++){ // 위 → 아래, 왼 → 오른쪽 순서 = 그리기 순서
+    const x=(i+.5)*step,y=(j+.5)*step,k=(Math.min(H-1,y|0)*W+Math.min(W-1,x|0))*4,r=pix[k]/255,g=pix[k+1]/255,b=pix[k+2]/255;
+    d[n++]=x;d[n++]=y;d[n++]=step*(.4+1.6*(1-(.299*r+.587*g+.114*b)));d[n++]=x*.04+y*.03;d[n++]=r;d[n++]=g;d[n++]=b;ar+=r;ag+=g;ab+=b;
+  }
+  gl.bindBuffer(gl.ARRAY_BUFFER,ib);gl.bufferData(gl.ARRAY_BUFFER,d,gl.STATIC_DRAW);
+  X=new Float32Array(N);Y=new Float32Array(N);OX=new Float32Array(N);OY=new Float32Array(N);VX=new Float32Array(N);VY=new Float32Array(N);OFF=new Float32Array(N*2);
+  for(let q=0;q<N;q++){X[q]=d[q*7];Y[q]=d[q*7+1];}
+  gl.bindBuffer(gl.ARRAY_BUFFER,ob);gl.bufferData(gl.ARRAY_BUFFER,OFF,gl.DYNAMIC_DRAW);
+  const m=.55/N;gl.clearColor(ar*m,ag*m,ab*m,1);
+  $('cntV').textContent=N+'개 · 굵기 '+step.toFixed(1)+'px';
+}
+
+let lastT=0,visible=true,running=false;
+function frame(ts){
+  if(!visible){running=false;return;}
+  if(ts-lastT<30){requestAnimationFrame(frame);return;} // 30fps
+  lastT=ts;const now=ts/1000;
+  simulate();
+  gl.viewport(0,0,cv.width,cv.height);gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.uniform2f(U.u_res,W,H);gl.uniform1f(U.u_time,now);gl.uniform1f(U.u_w,step);gl.uniform1f(U.u_ls,lenMul);gl.uniform1f(U.u_dpr,dpr);
+  gl.bindBuffer(gl.ARRAY_BUFFER,ob);gl.bufferSubData(gl.ARRAY_BUFFER,0,OFF); // 털별 오프셋만 갱신
+  gl.drawArraysInstanced(gl.TRIANGLE_STRIP,0,4,N); // 호출 1번
+  requestAnimationFrame(frame);
+}
+
+function pos(e){const r=cv.getBoundingClientRect();return[e.clientX-r.left,e.clientY-r.top];}
+function showRing(x,y,on){ring.style.transform=`translate(${x-R}px,${y-R}px)`;ring.style.opacity=on?1:0;}
+function simulate(){
+  px_=hx;py_=hy;hx+=(tx-hx)*.3;hy+=(ty-hy)*.3;            // 포인터를 부드럽게 따라가 급점프 제거
+  const vx=hx-px_,vy=hy-py_;
+  if(inside&&Math.hypot(vx,vy)>.8){Dx+=(vx-Dx)*.2;Dy+=(vy-Dy)*.2;} // 움직일 때만 끌림 방향 갱신
+  else{Dx*=.985;Dy*=.985;}                                  // 느려지거나 멈춰도 서서히만 잦아듦(약 2~3초)
+  const dm=Math.hypot(Dx,Dy);if(dm>24){Dx*=24/dm;Dy*=24/dm;}
+  const ax=px_,ay=py_,abx=hx-ax,aby=hy-ay,ab2=abx*abx+aby*aby+1e-6;
+  for(let i=0;i<N;i++){
+    let gx=0,gy=0;
+    if(inside){ // 이전→현재 포인터 선분과의 거리 사용: 빠르게 움직여도 빈틈 없음
+      const dx=X[i]-ax,dy=Y[i]-ay;let t=(dx*abx+dy*aby)/ab2;t=t<0?0:t>1?1:t;
+      const cx=dx-abx*t,cy=dy-aby*t,d2=cx*cx+cy*cy;
+      if(d2<R*R){let f=1-Math.sqrt(d2)/R;f=f*f*(3-2*f);gx=Dx*f*3;gy=Dy*f*2;}
+    }
+    VX[i]=(VX[i]+(gx-OX[i])*.05)*.82;VY[i]=(VY[i]+(gy-OY[i])*.05)*.82; // 느슨한 스프링: 가볍고 부드럽게
+    OX[i]+=VX[i];OY[i]+=VY[i];OFF[2*i]=OX[i];OFF[2*i+1]=OY[i];
+  }
+}
+cv.addEventListener('pointerdown',e=>{const[x,y]=pos(e);tx=hx=px_=x;ty=hy=py_=y;inside=true;cv.setPointerCapture(e.pointerId);showRing(x,y,1);});
+cv.addEventListener('pointermove',e=>{
+  const[x,y]=pos(e);if(!inside){tx=hx=px_=x;ty=hy=py_=y;inside=true;}
+  tx=x;ty=y;showRing(x,y,1);
+});
+['pointerup','pointercancel'].forEach(n=>cv.addEventListener(n,e=>{if(e.pointerType!=='mouse'){ring.style.opacity=0;inside=false;}}));
+cv.addEventListener('pointerleave',()=>{ring.style.opacity=0;inside=false;});
+
+const setR=()=>{R=+$('rad').value;$('radV').textContent=R+'px';ring.style.width=ring.style.height=2*R+'px';};
+$('rad').addEventListener('input',setR);
+const LENS=[[1,'짧게'],[1.5,'중간'],[2,'길게']];
+const setL=()=>{const l=LENS[+$('len').value];lenMul=l[0];$('lenV').textContent=l[1]+' (×'+l[0]+')';};
+$('len').addEventListener('input',setL);
+$('cnt').addEventListener('input',()=>{if(pix)rebuild();});
+function load(f){if(!f||!f.type.startsWith('image/'))return;const u=URL.createObjectURL(f),im=new Image();im.onload=()=>{src=im;themed=false;URL.revokeObjectURL(u);build();};im.src=u;}
+$('file').addEventListener('change',e=>load(e.target.files[0]));
+wrap.addEventListener('dragover',e=>{e.preventDefault();wrap.classList.add('drag');});
+wrap.addEventListener('dragleave',()=>wrap.classList.remove('drag'));
+wrap.addEventListener('drop',e=>{e.preventDefault();wrap.classList.remove('drag');load(e.dataTransfer.files[0]);});
+let rt,lastW=0;addEventListener('resize',()=>{clearTimeout(rt);rt=setTimeout(()=>{if(wrap.clientWidth!==lastW){lastW=wrap.clientWidth;build();}},200);});
+new IntersectionObserver(es=>{visible=es[0].isIntersecting;if(visible&&!running){running=true;requestAnimationFrame(frame);}}).observe(wrap);
+
+setR();setL();demo();lastW=wrap.clientWidth;build();running=true;requestAnimationFrame(frame);
+</script>
+</body>
+</html>
